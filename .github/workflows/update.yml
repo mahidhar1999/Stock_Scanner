@@ -30,7 +30,7 @@ jobs:
     - name: Pull latest before commit (fixes the fetch-first error)
       run: |
         git config user.name "mahidahr1999"
-        git config user.email "amahidhar1999@gmail.com"
+        git config user.email "mahidhar1999@gmail.com"
         git pull --rebase origin master
 
     - name: Commit updated CSVs
