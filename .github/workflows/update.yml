@@ -2,7 +2,7 @@ name: Daily RS CSV Update
 
 on:
   schedule:
-    - cron: "0 1 * * *"   # Runs daily at 6:30 AM IST
+    - cron: "0 1 * * *"
   workflow_dispatch:
 
 jobs:
@@ -13,7 +13,7 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v3
       with:
-        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0   # required for proper pushing
 
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -24,19 +24,17 @@ jobs:
       run: |
         pip install pandas numpy yfinance
 
-    - name: Run main.py
+    - name: Run main script
       run: python main.py
 
-    - name: Pull latest before commit (fixes the fetch-first error)
+    - name: Commit changes
       run: |
-        git config user.name "mahidhar1999"
-        git config user.email "mahidhar1999@gmail.com"
-        git pull --rebase origin master
-
-    - name: Commit updated CSVs
-      run: |
-        git add -A
-        git commit -m "Daily CSV auto-update" || echo "No changes"
+        git config --global user.name "mahidhar1999"
+        git config --global user.email "mahidhar1999@gmail.com"
+        git add all_stocks_raw.csv all_stocks_filtered.csv || true
+        git commit -m "Auto-update CSVs" || echo "No changes"
 
     - name: Push changes
-      run: git push origin master
+      uses: ad-m/github-push-action@v0.6.0
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}

@@ -333,26 +333,169 @@ if symbol_list:
 
 
 # =====================================================
-# FUNDAMENTAL SNAPSHOT (for selected stock)
+# FUNDAMENTAL SNAPSHOT (Professional Full Version)
 # =====================================================
-st.subheader("📘 Fundamental Snapshot")
+st.subheader("📘 Full Fundamental Snapshot")
 
-def format_mcap(v):
-    return f"{v/1e7:.2f} Cr" if pd.notna(v) else "N/A"
+@st.cache_data(ttl=86400)
+def load_fundamentals_full(ticker):
+    try:
+        return yf.Ticker(ticker).info
+    except:
+        return {}
 
-info = yf.Ticker(to_yf(stock_symbol)).info
+def fmt(v, digits=2):
+    """Default number formatter"""
+    try:
+        return f"{float(v):.{digits}f}"
+    except:
+        return "N/A"
 
-c1, c2, c3 = st.columns(3)
+def fmt_pct(v):
+    try:
+        return f"{float(v)*100:.2f}%"
+    except:
+        return "N/A"
 
-c1.metric("Market Cap", format_mcap(info.get("marketCap")))
-c1.metric("P/E Ratio", info.get("trailingPE", "N/A"))
+def fmt_cr(v):
+    # Market cap → Crores (Indian Format)
+    try:
+        return f"{v/1e7:.2f} Cr"
+    except:
+        return "N/A"
+def compute_peg(info):
+    pe = info.get("trailingPE")
+    eg = info.get("earningsGrowth")  # decimal e.g. 0.15 = 15%
 
-c2.metric("52W High", info.get("fiftyTwoWeekHigh", "N/A"))
-c2.metric("52W Low", info.get("fiftyTwoWeekLow", "N/A"))
+    if pe is None or eg is None or eg == 0:
+        return "N/A"
 
-c3.metric("ROE %", f"{info.get('returnOnEquity',0)*100:.2f}%")
-c3.metric("Profit Margin %", f"{info.get('profitMargins',0)*100:.2f}%")
+    try:
+        peg = pe / (eg * 100)
+        return f"{peg:.2f}"
+    except:
+        return "N/A"
 
-st.write("**Sector:**", info.get("sector", "N/A"))
-st.write("**Industry:**", info.get("industry", "N/A"))
-st.write("**Website:**", info.get("website", "N/A"))
+info = load_fundamentals_full(to_yf(stock_symbol))
+
+if not info:
+    st.warning("⚠ No fundamentals available for this stock.")
+else:
+
+    # =================================================
+    # ROW 1 — VALUATION
+    # =================================================
+    st.markdown("### 💰 **Valuation**")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("Market Cap", fmt_cr(info.get("marketCap")))
+    col1.metric("Enterprise Value", fmt_cr(info.get("enterpriseValue")))
+    col1.metric("P/E (TTM)", fmt(info.get("trailingPE")))
+    col1.metric("Forward P/E", fmt(info.get("forwardPE")))
+
+    col2.metric("P/S (TTM)", fmt(info.get("priceToSalesTrailing12Months")))
+    col2.metric("P/B", fmt(info.get("priceToBook")))
+    col2.metric("PEG Ratio", compute_peg(info))
+    col2.metric("EV/EBITDA", fmt(info.get("enterpriseToEbitda")))
+
+    col3.metric("Revenue/Share", fmt(info.get("revenuePerShare")))
+    col3.metric("Book Value Per Share", fmt(info.get("bookValue")))
+    col3.metric("EBITDA", fmt_cr(info.get("ebitda")))
+    col3.metric("Profit (Net Income)", fmt_cr(info.get("netIncomeToCommon")))
+
+    st.markdown("---")
+
+    # =================================================
+    # ROW 2 — GROWTH
+    # =================================================
+    st.markdown("### 📈 **Growth Metrics**")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("Revenue Growth YoY", fmt_pct(info.get("revenueGrowth")))
+    col1.metric("Quarterly Revenue Growth", fmt_pct(info.get("revenueQuarterlyGrowth")))
+
+    col2.metric("Earnings Growth YoY", fmt_pct(info.get("earningsGrowth")))
+    col2.metric("Quarterly Earnings Growth", fmt_pct(info.get("earningsQuarterlyGrowth")))
+
+    col3.metric("Free Cash Flow", fmt_cr(info.get("freeCashflow")))
+    col3.metric("Operating Cash Flow", fmt_cr(info.get("operatingCashflow")))
+
+    st.markdown("---")
+
+    # =================================================
+    # ROW 3 — PROFITABILITY
+    # =================================================
+    st.markdown("### 🧮 **Profitability Metrics**")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("Gross Margins", fmt_pct(info.get("grossMargins")))
+    col1.metric("Operating Margins", fmt_pct(info.get("operatingMargins")))
+    col1.metric("Profit Margins", fmt_pct(info.get("profitMargins")))
+
+    col2.metric("ROE", fmt_pct(info.get("returnOnEquity")))
+    col2.metric("ROA", fmt_pct(info.get("returnOnAssets")))
+    col2.metric("ROIC", fmt_pct(info.get("returnOnCapital")))  # may be missing
+
+    col3.metric("EBITDA Margin", fmt_pct(info.get("ebitdaMargins")))
+    col3.metric("Net Margin", fmt_pct(info.get("netMargins")))
+    col3.metric("EPS (TTM)", fmt(info.get("trailingEps")))
+
+    st.markdown("---")
+
+    # =================================================
+    # ROW 4 — PRICE METRICS
+    # =================================================
+    st.markdown("### 📊 **Price & Trend Metrics**")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("52W High", fmt(info.get("fiftyTwoWeekHigh")))
+    col1.metric("52W Low", fmt(info.get("fiftyTwoWeekLow")))
+    col1.metric("50-Day Avg", fmt(info.get("fiftyDayAverage")))
+
+    col2.metric("200-Day Avg", fmt(info.get("twoHundredDayAverage")))
+    col2.metric("Beta", fmt(info.get("beta")))
+    col2.metric("Avg Volume", fmt(info.get("averageVolume")))
+
+    col3.metric("Shares Outstanding", fmt(info.get("sharesOutstanding")))
+    col3.metric("Float Shares", fmt(info.get("floatShares")))
+    col3.metric("Implied Shares", fmt(info.get("impliedSharesOutstanding")))
+
+    st.markdown("---")
+
+    # =================================================
+    # ROW 5 — BALANCE SHEET
+    # =================================================
+    st.markdown("### 🧾 **Balance Sheet Metrics**")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("Total Cash", fmt_cr(info.get("totalCash")))
+    col1.metric("Total Debt", fmt_cr(info.get("totalDebt")))
+    col1.metric("Debt/Equity", fmt(info.get("debtToEquity")))
+
+    col2.metric("Current Ratio", fmt(info.get("currentRatio")))
+    col2.metric("Quick Ratio", fmt(info.get("quickRatio")))
+    col2.metric("Cash per Share", fmt(info.get("totalCashPerShare")))
+
+    col3.metric("Total Revenue", fmt_cr(info.get("totalRevenue")))
+    col3.metric("Gross Profit", fmt_cr(info.get("grossProfits")))
+    col3.metric("EBITDA", fmt_cr(info.get("ebitda")))
+
+    st.markdown("---")
+
+    # =================================================
+    # COMPANY PROFILE
+    # =================================================
+    st.markdown("### 🏢 **Company Profile**")
+
+    st.write(f"**Name:** {info.get('longName','N/A')}")
+    st.write(f"**Sector:** {info.get('sector','N/A')}")
+    st.write(f"**Industry:** {info.get('industry','N/A')}")
+    st.write(f"**Employees:** {info.get('fullTimeEmployees','N/A')}")
+    st.write(f"**Website:** {info.get('website','N/A')}")
+    st.write(f"**City:** {info.get('city','N/A')}, {info.get('country','N/A')}")
+
