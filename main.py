@@ -1,122 +1,150 @@
 import pandas as pd
 import yfinance as yf
 import numpy as np
+import requests
 import time
 
 # ---------------------------
-# LOAD ALL SYMBOLS
+# LOAD SYMBOL LIST
 # ---------------------------
-print("Loading all NIFTY stocks from CSV...")
+print("Loading symbols...")
 df = pd.read_csv("stocks.csv")
-
 symbols = (df["SYMBOL"] + ".NS").tolist()
-total_symbols = len(symbols)
-
-print(f"Total symbols: {total_symbols}")
+total = len(symbols)
+print("Total symbols:", total)
 
 # ---------------------------
-# DOWNLOAD NIFTY
+# NSE SESSION (FAST)
 # ---------------------------
-print("\nDownloading NIFTY Index (^NSEI)...")
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://www.nseindia.com/"
+})
+
+def get_fundamentals_fast(symbol):
+    """
+    Extremely fast fundamentals:
+    - Sector from NSE API
+    - Shares Outstanding → compute MarketCap manually
+    """
+    short = symbol.replace(".NS", "")
+
+    try:
+        url = f"https://www.nseindia.com/api/quote-equity?symbol={short}"
+        data = session.get(url).json()
+
+        sector = data["industryInfo"].get("industry")
+        shares = data["securityInfo"].get("issuedSize")  # shares outstanding
+
+        return sector, shares
+
+    except:
+        return None, None
+
+# ---------------------------
+# NIFTY INDEX
+# ---------------------------
+print("Downloading Nifty...")
 nifty = yf.download("^NSEI", period="300d", auto_adjust=True)
-
-nifty_close_cols = [c for c in nifty.columns if "Close" in c]
-nifty_close = nifty[nifty_close_cols[0]]
+nifty_close = nifty[[col for col in nifty.columns if "Close" in col][0]]
 
 # ---------------------------
-# PROCESS IN BATCHES OF 50
+# PROCESS BATCHES
 # ---------------------------
-batch_size = 500
 results = []
+batch_size = 300
 
-def process_batch(batch_symbols):
-    print(f"\nDownloading batch: {batch_symbols}")
+def process_batch(batch):
+    print(f"\nDownloading price batch ({len(batch)})...")
 
     data = yf.download(
-        batch_symbols,
+        batch,
         period="300d",
         group_by="ticker",
         auto_adjust=True,
         threads=True
     )
 
-    for symbol in batch_symbols:
-        print(f"Processing {symbol}...")
+    for sym in batch:
+        print("Processing:", sym)
+
         try:
-            stock = data[symbol].copy()
+            stock = data[sym].copy()
             if stock.empty:
-                print("  → No data for symbol")
+                print("⚠ No price data:", sym)
                 continue
 
-            # Get Close column
-            close_cols = [c for c in stock.columns if "Close" in c]
-            close_series = stock[close_cols[0]]
-            stock["CLOSE_FIX"] = close_series
+            close = stock[[c for c in stock.columns if "Close" in c][0]]
+            stock["Close"] = close
 
             # EMAs
-            stock["EMA5"] = stock["CLOSE_FIX"].ewm(span=5).mean()
-            stock["EMA20"] = stock["CLOSE_FIX"].ewm(span=20).mean()
-            stock["EMA50"] = stock["CLOSE_FIX"].ewm(span=50).mean()
-            stock["EMA200"] = stock["CLOSE_FIX"].ewm(span=200).mean()
+            stock["EMA5"] = close.ewm(span=5).mean()
+            stock["EMA20"] = close.ewm(span=20).mean()
+            stock["EMA50"] = close.ewm(span=50).mean()
+            stock["EMA200"] = close.ewm(span=200).mean()
 
-            # Align NIFTY
+            # RS Calculation
             nifty_aligned = nifty_close.asof(stock.index)
-
-            close_arr = stock["CLOSE_FIX"].to_numpy()
+            arr = close.to_numpy()
             nifty_arr = nifty_aligned.to_numpy()
 
-            # Shift arrays
             shift = 65
-            close_shift = np.concatenate([np.full(shift, np.nan), close_arr[:-shift]])
+            arr_shift = np.concatenate([np.full(shift, np.nan), arr[:-shift]])
             nifty_shift = np.concatenate([np.full(shift, np.nan), nifty_arr[:-shift]])
 
-            # RS
-            rs_arr = (close_arr / close_shift) / (nifty_arr / nifty_shift) - 1
-            stock["RS"] = pd.Series(rs_arr, index=stock.index)
+            rs = (arr / arr_shift) / (nifty_arr / nifty_shift) - 1
+            stock["RS"] = rs
 
             last = stock.iloc[-1]
 
+            # FAST FUNDAMENTALS
+            mcap, sector = get_fundamentals_fast(sym)
+
+            sector, shares = get_fundamentals_fast(sym)
+            if shares:
+                mcap = last["Close"] * shares
+            else:
+                mcap = None
+
+
             results.append({
-                "Symbol": symbol.replace(".NS", ""),
-                "Close": last["CLOSE_FIX"],
+                "Symbol": sym.replace(".NS", ""),
+                "Close": last["Close"],
                 "RS": last["RS"],
                 "EMA5": last["EMA5"],
                 "EMA20": last["EMA20"],
                 "EMA50": last["EMA50"],
                 "EMA200": last["EMA200"],
+                "MarketCap": mcap,
+                "Sector": sector
             })
 
         except Exception as e:
-            print("  → Error:", e)
+            print("Error processing", sym, "→", e)
 
 
 # ---------------------------
-# RUN BATCHES
+# RUN ALL BATCHES
 # ---------------------------
-for i in range(0, total_symbols, batch_size):
-    batch = symbols[i:i+batch_size]
+for i in range(0, total, batch_size):
+    batch = symbols[i:i + batch_size]
     process_batch(batch)
-    time.sleep(2)   # prevent rate-limit
-
+    time.sleep(1)
 
 # ---------------------------
-# BUILD RESULT CSV
+# SAVE CSVs
 # ---------------------------
-result_df = pd.DataFrame(results)
-print("\nFINAL RESULT:")
-print(result_df)
+df_all = pd.DataFrame(results)
+df_all.to_csv("all_stocks_raw.csv", index=False)
 
-filtered = result_df[
-    (result_df["RS"] > 0) &
-    (result_df["EMA5"] > result_df["EMA20"]) &
-    (result_df["EMA20"] > result_df["EMA50"]) &
-    (result_df["EMA50"] > result_df["EMA200"])
+df_filtered = df_all[
+    (df_all["RS"] > 0) &
+    (df_all["EMA5"] > df_all["EMA20"]) &
+    (df_all["EMA20"] > df_all["EMA50"]) &
+    (df_all["EMA50"] > df_all["EMA200"])
 ]
 
-print("\nFILTERED STOCKS:")
-print(filtered)
+df_filtered.to_csv("all_stocks_filtered.csv", index=False)
 
-result_df.to_csv("all_stocks_raw.csv", index=False)
-filtered.to_csv("all_stocks_filtered.csv", index=False)
-
-print("\nSaved all_stocks_raw.csv & all_stocks_filtered.csv")
+print("\nSaved all CSVs successfully!")

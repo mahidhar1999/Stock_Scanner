@@ -3,184 +3,192 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
-import math
-from time import sleep
 
-# -----------------------------------------------------
+
+# =====================================================
 # PAGE CONFIG
-# -----------------------------------------------------
-st.set_page_config(page_title="RS Screener Dashboard (Multi-Timeframe)", layout="wide")
-st.title("📊 RS Screener — Multi-Timeframe (Daily / Weekly / Monthly)")
-st.caption("Daily RS = 65 bars | Weekly RS = 13 weeks | Monthly RS = 3 months (TradingView-exact alignment)")
+# =====================================================
+st.set_page_config(page_title="RS Screener Dashboard", layout="wide")
+st.title("📊 RS Screener — Multi-Timeframe Strength Analyzer")
+st.caption("Daily RS = 65 bars | Weekly RS = 13 weeks | Monthly RS = 3 months (TradingView-exact)")
 
-# -----------------------------------------------------
-# LOAD CSVs (cached)
-# -----------------------------------------------------
+
+# =====================================================
+# LOAD CSV DATA (cached)
+# =====================================================
 @st.cache_data(ttl=86400)
-def load_csv_data():
+def load_csv():
     raw = pd.read_csv("all_stocks_raw.csv")
     filt = pd.read_csv("all_stocks_filtered.csv")
     return raw, filt
 
-raw_df, filtered_df = load_csv_data()
 
-# Sidebar filters
-st.sidebar.header("Filters")
-min_price = st.sidebar.number_input("Minimum Price", value=50)
-min_rs = st.sidebar.number_input("Minimum RS (daily)", value=0.0)
+raw_df, filtered_df = load_csv()
 
+# Convert MarketCap to Crores
+raw_df["MarketCapCr"] = raw_df["MarketCap"] / 1e7
+
+
+
+# =====================================================
+# SIDEBAR FILTERS
+# =====================================================
+st.sidebar.header("Filter Stocks")
+
+min_rs = st.sidebar.number_input("Min RS (Daily)", value=0.0)
+min_mcap = st.sidebar.number_input("Min MarketCap (Cr)", value=0.0)
+sector_filter = st.sidebar.selectbox(
+    "Sector Filter",
+    ["All"] + sorted(raw_df["Sector"].dropna().unique().tolist())
+)
+
+
+
+# =====================================================
+# APPLY FILTER LOGIC
+# =====================================================
 filtered = raw_df[
-    (raw_df["Close"] > min_price) &
-    (raw_df["RS"] > min_rs)
+    (raw_df["RS"] > min_rs) &
+    (raw_df["MarketCapCr"] > min_mcap)
 ]
 
-with st.expander("Filtered Stocks (After Conditions)"):
-    st.dataframe(filtered, use_container_width=True)
+if sector_filter != "All":
+    filtered = filtered[filtered["Sector"] == sector_filter]
 
-with st.expander("Strong Trend Stocks (5 > 20 > 50 > 200)"):
-    st.dataframe(filtered_df, use_container_width=True)
+filtered_display = filtered[
+    ["Symbol", "Close", "MarketCapCr", "RS", 
+     "EMA5", "EMA20", "EMA50", "EMA200", "Sector"]
+]
 
-# -----------------------------------------------------
-# Utility: safe ticker -> yahoo format
-# -----------------------------------------------------
+# Add serial numbers
+filtered_display = filtered_display.reset_index(drop=True)
+filtered_display.index += 1
+filtered_display.index.name = "#"
+
+
+
+# =====================================================
+# DISPLAY — FILTERED STOCKS
+# =====================================================
+with st.expander("📌 Filtered Stocks (After Conditions)"):
+    st.dataframe(filtered_display, use_container_width=True)
+
+
+
+# =====================================================
+# SECTOR RS RANKING
+# =====================================================
+st.subheader("📈 Sector Strength Ranking (Market-Cap Weighted RS)")
+
+# Filter only bullish stocks
+df_bull = raw_df[raw_df["RS"] > 0].copy()
+
+# Weight = MarketCapCr
+df_bull["Weight"] = df_bull["MarketCapCr"]
+
+sector_rs = df_bull.groupby("Sector").apply(
+    lambda x: (x["RS"] * x["Weight"]).sum() / x["Weight"].sum()
+).reset_index(name="Weighted_RS")
+
+# Sort in descending order
+sector_rs = sector_rs.sort_values("Weighted_RS", ascending=False)
+
+# Assign proper sequential numbering
+sector_rs = sector_rs.reset_index(drop=True)
+sector_rs.index = sector_rs.index + 1
+sector_rs.index.name = "#"
+
+st.dataframe(sector_rs, use_container_width=True, hide_index=False)
+
+
+# =====================================================
+# TICKER UTILITY
+# =====================================================
 def to_yf(ticker):
-    if ticker.endswith(".NS"):
-        return ticker
-    return ticker + ".NS"
+    return ticker if ticker.endswith(".NS") else ticker + ".NS"
 
-# -----------------------------------------------------
-# Batch download helper (cached)
-# -----------------------------------------------------
+
+
+# =====================================================
+# RS CALCULATION HELPERS
+# =====================================================
+def compute_rs(series_stock, series_bench, lookback):
+    rs = (series_stock / series_stock.shift(lookback)) / \
+         (series_bench / series_bench.shift(lookback)) - 1
+    return rs.replace([np.inf, -np.inf], np.nan)
+
+
 @st.cache_data(ttl=1800)
 def batch_download(tickers, period="24mo"):
-    """
-    Download multiple tickers in one batch. Returns DataFrame (multiindex) as returned by yfinance.
-    """
-    # ensure ticker list non-empty
     if not tickers:
         return pd.DataFrame()
-    # call yfinance
-    data = yf.download(tickers, period=period, interval="1d", auto_adjust=False, threads=True, group_by='ticker')
-    return data
+    return yf.download(
+        tickers, period=period, interval="1d",
+        auto_adjust=False, threads=True, group_by='ticker'
+    )
 
-# -----------------------------------------------------
-# Compute RS for one pair of series (array-like), given lookback in bars
-# -----------------------------------------------------
-def compute_rs_from_series(stock_close, bench_close, lookback):
-    # stock_close and bench_close must be aligned same index length
-    rs = (stock_close / stock_close.shift(lookback)) / (bench_close / bench_close.shift(lookback)) - 1
-    rs = rs.replace([np.inf, -np.inf], np.nan)
-    return rs
 
-# -----------------------------------------------------
-# Compute multi-timeframe RS across symbol_list (batched)
-# -----------------------------------------------------
+
+# =====================================================
+# COMPUTE MULTI-TIMEFRAME RS
+# =====================================================
 @st.cache_data(ttl=1800)
-def compute_multi_rs(symbol_list, batch_size=40):
-    """
-    Returns DataFrame with columns:
-    Symbol, RS_Daily (latest), RS_Weekly (latest), RS_Month (latest)
-    """
-    results = []
-    symbols_yf = [to_yf(s) for s in symbol_list]
+def compute_multi_rs(symbols, batch_size=40):
 
-    # download NIFTY raw (same period)
-    nifty = yf.download("^NSEI", period="24mo", interval="1d", auto_adjust=False)
+    results = []
+    symbols_yf = [to_yf(s) for s in symbols]
+
+    # Download NIFTY
+    nifty = yf.download("^NSEI", period="24mo")
     if isinstance(nifty.columns, pd.MultiIndex):
         nifty.columns = nifty.columns.get_level_values(0)
-    nifty = nifty.reset_index()[["Date", "Close"]].rename(columns={"Close":"NIFTY"})
+    nifty = nifty.reset_index()[["Date", "Close"]].rename(columns={"Close": "NIFTY"})
 
-    # process in batches
+    # Process in batches
     for i in range(0, len(symbols_yf), batch_size):
-        batch = symbols_yf[i:i+batch_size]
-        data = batch_download(batch, period="24mo")
-        # if single ticker, yfinance returns DataFrame with columns
-        if not isinstance(data.columns, pd.MultiIndex):
-            # single ticker DataFrame
-            # find which ticker
-            if len(batch) == 1:
-                t = batch[0]
-                df = data.copy().reset_index()[["Date", "Close"]].rename(columns={"Close":"Close"})
-                # align asof
-                merged = pd.merge_asof(df.sort_values("Date"), nifty.sort_values("Date"), on="Date", direction="backward")
-                merged["NIFTY"] = merged["NIFTY"].fillna(method="ffill")
-                # daily RS (65)
-                rs_daily_series = compute_rs_from_series(merged["Close"], merged["NIFTY"], 65)
-                rs_daily = rs_daily_series.dropna().iloc[-1] if not rs_daily_series.dropna().empty else np.nan
-                # weekly / monthly resample
-                s_close = df.set_index("Date")["Close"]
-                s_week = s_close.resample('W-FRI').last().dropna()
-                n_week = nifty.set_index("Date")["NIFTY"].resample('W-FRI').last().dropna()
-                if len(s_week) > 20 and len(n_week) > 20:
-                    # align weekly
-                    merged_week = pd.merge_asof(s_week.reset_index().sort_values("Date"), n_week.reset_index().sort_values("Date"), on="Date", direction="backward")
-                    rs_w = compute_rs_from_series(merged_week["Close"], merged_week["NIFTY"], 13)
-                    rs_week = rs_w.dropna().iloc[-1] if not rs_w.dropna().empty else np.nan
-                else:
-                    rs_week = np.nan
-                s_month = s_close.resample('M').last().dropna()
-                n_month = nifty.set_index("Date")["NIFTY"].resample('M').last().dropna()
-                if len(s_month) > 6 and len(n_month) > 6:
-                    merged_month = pd.merge_asof(s_month.reset_index().sort_values("Date"), n_month.reset_index().sort_values("Date"), on="Date", direction="backward")
-                    rs_m = compute_rs_from_series(merged_month["Close"], merged_month["NIFTY"], 3)
-                    rs_month = rs_m.dropna().iloc[-1] if not rs_m.dropna().empty else np.nan
-                else:
-                    rs_month = np.nan
-                results.append({
-                    "Symbol": t.replace(".NS",""),
-                    "RS_Daily": rs_daily,
-                    "RS_Weekly": rs_week,
-                    "RS_Month": rs_month
-                })
-            continue
 
-        # multi-ticker batch
-        # data.columns is MultiIndex (ticker, Price)
-        tickers_in_data = sorted({c[0] for c in data.columns})
-        for t in tickers_in_data:
+        batch = symbols_yf[i:i+batch_size]
+        data = batch_download(batch)
+
+        tickers = sorted({c[0] for c in data.columns})
+
+        for t in tickers:
             try:
                 df = data[t].copy()
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
-                df = df.reset_index()[["Date","Close"]]
-                # align with nifty by merge_asof
-                merged = pd.merge_asof(df.sort_values("Date"), nifty.sort_values("Date"), on="Date", direction="backward")
-                merged["NIFTY"] = merged["NIFTY"].fillna(method="ffill")
-                # daily RS
-                rs_daily_series = compute_rs_from_series(merged["Close"], merged["NIFTY"], 65)
-                rs_daily = rs_daily_series.dropna().iloc[-1] if not rs_daily_series.dropna().empty else np.nan
+                df = df.reset_index()[["Date", "Close"]]
 
-                # weekly RS
-                s_close = df.set_index("Date")["Close"]
-                s_week = s_close.resample('W-FRI').last().dropna()
-                n_week = nifty.set_index("Date")["NIFTY"].resample('W-FRI').last().dropna()
-                if len(s_week) > 20 and len(n_week) > 20:
-                    merged_week = pd.merge_asof(s_week.reset_index().sort_values("Date"), n_week.reset_index().sort_values("Date"), on="Date", direction="backward")
-                    rs_w = compute_rs_from_series(merged_week["Close"], merged_week["NIFTY"], 13)
-                    rs_week = rs_w.dropna().iloc[-1] if not rs_w.dropna().empty else np.nan
-                else:
-                    rs_week = np.nan
+                merged = pd.merge_asof(df.sort_values("Date"),
+                                       nifty.sort_values("Date"),
+                                       on="Date", direction="backward")
 
-                # monthly RS
-                s_month = s_close.resample('M').last().dropna()
-                n_month = nifty.set_index("Date")["NIFTY"].resample('M').last().dropna()
-                if len(s_month) > 6 and len(n_month) > 6:
-                    merged_month = pd.merge_asof(s_month.reset_index().sort_values("Date"), n_month.reset_index().sort_values("Date"), on="Date", direction="backward")
-                    rs_m = compute_rs_from_series(merged_month["Close"], merged_month["NIFTY"], 3)
-                    rs_month = rs_m.dropna().iloc[-1] if not rs_m.dropna().empty else np.nan
-                else:
-                    rs_month = np.nan
+                # DAILY RS (65)
+                rs_daily = compute_rs(merged["Close"], merged["NIFTY"], 65)
+                rs_daily_last = rs_daily.dropna().iloc[-1]
+
+                # WEEKLY RS
+                s_w = df.set_index("Date")["Close"].resample("W-FRI").last()
+                n_w = nifty.set_index("Date")["NIFTY"].resample("W-FRI").last()
+                m_w = pd.merge_asof(s_w.reset_index(), n_w.reset_index(), on="Date")
+                rs_week = compute_rs(m_w["Close"], m_w["NIFTY"], 13).dropna().iloc[-1]
+
+                # MONTHLY RS
+                s_m = df.set_index("Date")["Close"].resample("M").last()
+                n_m = nifty.set_index("Date")["NIFTY"].resample("M").last()
+                m_m = pd.merge_asof(s_m.reset_index(), n_m.reset_index(), on="Date")
+                rs_month = compute_rs(m_m["Close"], m_m["NIFTY"], 3).dropna().iloc[-1]
 
                 results.append({
-                    "Symbol": t.replace(".NS",""),
-                    "RS_Daily": rs_daily,
+                    "Symbol": t.replace(".NS", ""),
+                    "RS_Daily": rs_daily_last,
                     "RS_Weekly": rs_week,
                     "RS_Month": rs_month
                 })
-            except Exception as e:
-                # if one ticker fails, continue
+
+            except:
                 results.append({
-                    "Symbol": t.replace(".NS",""),
+                    "Symbol": t.replace(".NS", ""),
                     "RS_Daily": np.nan,
                     "RS_Weekly": np.nan,
                     "RS_Month": np.nan
@@ -188,225 +196,163 @@ def compute_multi_rs(symbol_list, batch_size=40):
 
     return pd.DataFrame(results)
 
-# -----------------------------------------------------
-# UI: compute button and progress
-# -----------------------------------------------------
-st.subheader("Multi-Timeframe RS Scanner")
-colA, colB = st.columns([3,1])
-with colA:
-    st.write("Compute Daily/Weekly/Monthly RS for filtered symbols and create a composite Trend Score.")
-with colB:
-    compute_btn = st.button("Compute Multi-TF RS")
 
+
+# =====================================================
+# COMPUTE BUTTON — MULTI-TF RS
+# =====================================================
+st.subheader("🧪 Multi-Timeframe RS Scanner")
+
+compute_btn = st.button("🔍 Compute Multi-TF RS")
 rs_df = None
+
 if compute_btn:
+
     symbol_list = filtered_df["Symbol"].tolist()
-    if not symbol_list:
-        st.warning("No symbols in filtered list.")
-    else:
-        with st.spinner("Downloading & computing RS (this may take a short while)..."):
-            # compute multi RS (cached)
-            rs_df = compute_multi_rs(symbol_list, batch_size=40)
 
-            # compute percentiles for each RS (we use rank pct)
-            for col in ["RS_Daily","RS_Weekly","RS_Month"]:
-                rs_df[col + "_pct"] = rs_df[col].rank(method="average", pct=True).fillna(0)
+    with st.spinner("Computing RS…"):
+        rs_df = compute_multi_rs(symbol_list)
 
-            # composite score: weights 0.5 month, 0.3 week, 0.2 daily
-            rs_df["Score"] = (0.5 * rs_df["RS_Month_pct"] + 0.3 * rs_df["RS_Weekly_pct"] + 0.2 * rs_df["RS_Daily_pct"]) * 100
-            rs_df["Score"] = rs_df["Score"].round(2)
+        # Percentile weights
+        for col in ["RS_Daily", "RS_Weekly", "RS_Month"]:
+            rs_df[col+"_pct"] = rs_df[col].rank(pct=True)
 
-            # sort by Score desc
-            rs_df.sort_values("Score", ascending=False, inplace=True)
-            rs_df.reset_index(drop=True, inplace=True)
+        rs_df["Score"] = (
+            0.5 * rs_df["RS_Month_pct"] +
+            0.3 * rs_df["RS_Weekly_pct"] +
+            0.2 * rs_df["RS_Daily_pct"]
+        ) * 100
 
-            st.success("Multi-TF RS computed.")
-            st.dataframe(rs_df[["Symbol","RS_Daily","RS_Weekly","RS_Month","Score"]].head(200), use_container_width=True)
+        # Merge Close + MarketCapCr from raw_df
+        rs_df = rs_df.merge(
+            raw_df[["Symbol", "Close", "MarketCapCr"]],
+            on="Symbol",
+            how="left"
+        )
 
-            # cache latest table to session for chart viewer
-            st.session_state["multi_rs_table"] = rs_df
+        # Sort by score
+        rs_df = rs_df.sort_values("Score", ascending=False)
 
-# If table already in session, allow quick access
-if "multi_rs_table" in st.session_state and rs_df is None:
-    rs_df = st.session_state["multi_rs_table"]
-    st.info("Using previously computed Multi-TF RS (cached in session).")
+        # 🔥 Add ranking number
+        rs_df = rs_df.reset_index(drop=True)
+        rs_df.index = rs_df.index + 1
+        rs_df.index.name = "#"
 
-# -----------------------------------------------------
-# Selected Stock Details (Multi-TF RS) WITH NAVIGATION
-# -----------------------------------------------------
-st.subheader("📈 Selected Stock Details (Multi-TF RS)")
+        # Show table
+        st.dataframe(
+            rs_df[[
+                "Symbol", "Close", "MarketCapCr",
+                "RS_Daily", "RS_Weekly", "RS_Month",
+                "Score"
+            ]],
+            use_container_width=True
+        )
 
-symbol_list_chart = filtered_df["Symbol"].tolist()
+        st.session_state["rs_table"] = rs_df
 
-if not symbol_list_chart:
-    st.warning("Filtered symbol list empty.")
-else:
 
-    # Maintain index in session state
-    if "stock_index" not in st.session_state:
-        st.session_state.stock_index = 0
+# Load cached RS table
+if "rs_table" in st.session_state and rs_df is None:
+    rs_df = st.session_state["rs_table"]
+    st.info("Using cached RS table.")
 
-    # ---- DROPDOWN (no key, avoids overwriting session state) ----
-    stock_symbol = st.selectbox(
-        "Pick a stock for details:",
-        symbol_list_chart,
-        index=st.session_state.stock_index
+    st.dataframe(
+        rs_df[[
+            "Symbol", "Close", "MarketCapCr",
+            "RS_Daily", "RS_Weekly", "RS_Month",
+            "Score"
+        ]],
+        use_container_width=True
     )
 
-    # ---- NAVIGATION BUTTONS ----
-    col_prev, col_empty, col_next = st.columns([1, 6, 1])
 
-    with col_prev:
+# =====================================================
+# SELECTED STOCK SECTION
+# =====================================================
+st.subheader("📌 Stock Details + Chart")
+
+symbol_list = filtered_df["Symbol"].tolist()
+
+if symbol_list:
+
+    # Sync index
+    if "idx" not in st.session_state:
+        st.session_state.idx = 0
+
+    stock_symbol = st.selectbox(
+        "Choose a stock",
+        symbol_list,
+        index=st.session_state.idx
+    )
+
+    # NAVIGATION BUTTONS
+    col_p, col_n = st.columns([1,1])
+
+    with col_p:
         if st.button("⬅ Previous"):
-            st.session_state.stock_index = max(0, st.session_state.stock_index - 1)
+            st.session_state.idx = max(st.session_state.idx - 1, 0)
             st.rerun()
 
-    with col_next:
+    with col_n:
         if st.button("Next ➡"):
-            st.session_state.stock_index = min(len(symbol_list_chart) - 1, st.session_state.stock_index + 1)
+            st.session_state.idx = min(st.session_state.idx + 1, len(symbol_list)-1)
             st.rerun()
 
-    # ---- SYNC dropdown change ----
-    synced_symbol = symbol_list_chart[st.session_state.stock_index]
-    if stock_symbol != synced_symbol:
-        st.session_state.stock_index = symbol_list_chart.index(stock_symbol)
-
-    # -----------------------------------------------------
-    # Load stock price history
-    # -----------------------------------------------------
+    # LOAD PRICE DATA
     @st.cache_data(ttl=1800)
-    def load_stock_raw(ticker):
-        d = yf.download(ticker, period="24mo", interval="1d", auto_adjust=False)
-        if isinstance(d.columns, pd.MultiIndex):
-            d.columns = d.columns.get_level_values(0)
-        return d.reset_index()
+    def load_price(ticker):
+        df = yf.download(to_yf(ticker), period="24mo")
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df.reset_index()
 
-    ticker_full = to_yf(stock_symbol)
-    stock_df = load_stock_raw(ticker_full)
+    df_price = load_price(stock_symbol)
 
-    # -----------------------------------------------------
-    # Price Chart
-    # -----------------------------------------------------
+    # PRICE CHART
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
-        x=stock_df['Date'],
-        open=stock_df['Open'], high=stock_df['High'],
-        low=stock_df['Low'], close=stock_df['Close'],
-        increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
+        x=df_price['Date'],
+        open=df_price['Open'], high=df_price['High'],
+        low=df_price['Low'], close=df_price['Close'],
+        increasing_line_color="#26A69A",
+        decreasing_line_color="#EF5350"
     ))
-
-    fig.update_layout(
-        title=f"{stock_symbol} — Price (24 Months)",
-        height=450,
-        xaxis_rangeslider_visible=True
-    )
-
+    fig.update_layout(height=450, xaxis_rangeslider_visible=True)
     st.plotly_chart(fig, use_container_width=True)
 
-    # -----------------------------------------------------
-    # RS Values Display
-    # -----------------------------------------------------
+    # MULTI RS METRICS
     if rs_df is not None:
-        row = rs_df[rs_df["Symbol"] == stock_symbol]
+        row = rs_df[rs_df["Symbol"] == stock_symbol].iloc[0]
 
-        if not row.empty:
-            r = row.iloc[0]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Score", f"{row['Score']:.2f}")
+        c2.metric("RS Daily", f"{row['RS_Daily']:.2f}")
+        c3.metric("RS Weekly", f"{row['RS_Weekly']:.2f}")
+        c4.metric("RS Monthly", f"{row['RS_Month']:.2f}")
 
-            st.metric("Composite Score", f"{r['Score']:.2f}")
 
-            c1, c2, c3 = st.columns(3)
-            c1.metric("RS Daily (65)", f"{r['RS_Daily']:.2f}" if not pd.isna(r["RS_Daily"]) else "N/A")
-            c2.metric("RS Weekly (13)", f"{r['RS_Weekly']:.2f}" if not pd.isna(r["RS_Weekly"]) else "N/A")
-            c3.metric("RS Monthly (3)", f"{r['RS_Month']:.2f}" if not pd.isna(r["RS_Month"]) else "N/A")
 
-        else:
-            st.info("RS not computed for this stock yet.")
-    else:
-        st.info("Compute Multi-TF RS above to view RS details.")
-# -----------------------------------------------------
-# FUNDAMENTAL DATA (YFinance)
-# -----------------------------------------------------
+# =====================================================
+# FUNDAMENTAL SNAPSHOT (for selected stock)
+# =====================================================
 st.subheader("📘 Fundamental Snapshot")
 
-# ---------- Formatting helper ----------
-def format_market_cap(value):
-    if value is None or value != value:
-        return "N/A"
+def format_mcap(v):
+    return f"{v/1e7:.2f} Cr" if pd.notna(v) else "N/A"
 
-    # International format
-    if value >= 1_000_000_000_000:
-        intl = f"{value/1_000_000_000_000:.2f}T"
-    elif value >= 1_000_000_000:
-        intl = f"{value/1_000_000_000:.2f}B"
-    elif value >= 1_000_000:
-        intl = f"{value/1_000_000:.2f}M"
-    else:
-        intl = f"{value:,}"
+info = yf.Ticker(to_yf(stock_symbol)).info
 
-    # Indian Format (Crores)
-    cr = value / 10_000_000
-    if cr >= 100_000:
-        indi = f"{cr/100_000:.2f} Lakh Cr"
-    else:
-        indi = f"{cr:.2f} Cr"
+c1, c2, c3 = st.columns(3)
 
-    return f"{intl}  ({indi})"
+c1.metric("Market Cap", format_mcap(info.get("marketCap")))
+c1.metric("P/E Ratio", info.get("trailingPE", "N/A"))
 
+c2.metric("52W High", info.get("fiftyTwoWeekHigh", "N/A"))
+c2.metric("52W Low", info.get("fiftyTwoWeekLow", "N/A"))
 
-@st.cache_data(ttl=86400)
-def load_fundamentals(ticker):
-    """Fetch and clean yfinance fundamentals."""
-    try:
-        return yf.Ticker(ticker).info
-    except:
-        return {}
+c3.metric("ROE %", f"{info.get('returnOnEquity',0)*100:.2f}%")
+c3.metric("Profit Margin %", f"{info.get('profitMargins',0)*100:.2f}%")
 
-
-info = load_fundamentals(ticker_full)
-
-if not info:
-    st.warning("No fundamentals available for this stock.")
-else:
-    colA, colB, colC = st.columns(3)
-
-    # -------------------------------------------------
-    # COLUMN A — VALUATION
-    # -------------------------------------------------
-    mc = info.get("marketCap")
-    colA.metric("Market Cap", format_market_cap(mc))
-
-    pe = info.get("trailingPE")
-    colA.metric("P/E Ratio (TTM)", f"{pe:.2f}" if pe else "N/A")
-
-    ps = info.get("priceToSalesTrailing12Months")
-    colA.metric("Price-to-Sales", f"{ps:.2f}" if ps else "N/A")
-
-    # -------------------------------------------------
-    # COLUMN B — PRICE & EARNINGS
-    # -------------------------------------------------
-    high_52 = info.get("fiftyTwoWeekHigh")
-    low_52 = info.get("fiftyTwoWeekLow")
-    eps = info.get("trailingEps")
-
-    colB.metric("52 Week High", f"{high_52:.2f}" if high_52 else "N/A")
-    colB.metric("52 Week Low", f"{low_52:.2f}" if low_52 else "N/A")
-    colB.metric("EPS (TTM)", f"{eps:.2f}" if eps else "N/A")
-
-    # -------------------------------------------------
-    # COLUMN C — PROFITABILITY & GROWTH
-    # -------------------------------------------------
-    roe = info.get("returnOnEquity")
-    pm = info.get("profitMargins")
-    rev = info.get("revenueGrowth")
-
-    colC.metric("ROE %", f"{roe*100:.2f}%" if roe else "N/A")
-    colC.metric("Profit Margin %", f"{pm*100:.2f}%" if pm else "N/A")
-    colC.metric("Revenue Growth %", f"{rev*100:.2f}%" if rev else "N/A")
-
-    # -------------------------------------------------
-    # COMPANY PROFILE
-    # -------------------------------------------------
-    st.write("### 📂 Company Profile")
-    st.write(f"**Sector:** {info.get('sector', 'N/A')}")
-    st.write(f"**Industry:** {info.get('industry', 'N/A')}")
-    st.write(f"**Website:** {info.get('website', 'N/A')}")
+st.write("**Sector:**", info.get("sector", "N/A"))
+st.write("**Industry:**", info.get("industry", "N/A"))
+st.write("**Website:**", info.get("website", "N/A"))
