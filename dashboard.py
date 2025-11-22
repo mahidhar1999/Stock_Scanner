@@ -286,7 +286,7 @@ if symbol_list:
     )
 
     # NAVIGATION BUTTONS
-    col_p, col_n = st.columns([1,1])
+    col_p, spacer, col_n = st.columns([1, 5, 1])
 
     with col_p:
         if st.button("⬅ Previous"):
