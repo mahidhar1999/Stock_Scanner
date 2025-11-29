@@ -16,7 +16,6 @@ st.caption("Daily RS = 65 bars | Weekly RS = 13 weeks | Monthly RS = 3 months (T
 # =====================================================
 # LOAD CSV DATA (cached)
 # =====================================================
-@st.cache_data(ttl=86400)
 def load_csv():
     raw = pd.read_csv("all_stocks_raw.csv")
     filt = pd.read_csv("all_stocks_filtered.csv")
@@ -118,7 +117,6 @@ def compute_rs(series_stock, series_bench, lookback):
     return rs.replace([np.inf, -np.inf], np.nan)
 
 
-@st.cache_data(ttl=1800)
 def batch_download(tickers, period="24mo"):
     if not tickers:
         return pd.DataFrame()
@@ -132,7 +130,6 @@ def batch_download(tickers, period="24mo"):
 # =====================================================
 # COMPUTE MULTI-TIMEFRAME RS
 # =====================================================
-@st.cache_data(ttl=1800)
 def compute_multi_rs(symbols, batch_size=40):
 
     results = []
@@ -299,7 +296,6 @@ if symbol_list:
             st.rerun()
 
     # LOAD PRICE DATA
-    @st.cache_data(ttl=1800)
     def load_price(ticker):
         df = yf.download(to_yf(ticker), period="24mo")
         if isinstance(df.columns, pd.MultiIndex):
@@ -337,7 +333,6 @@ if symbol_list:
 # =====================================================
 st.subheader("📘 Full Fundamental Snapshot")
 
-@st.cache_data(ttl=86400)
 def load_fundamentals_full(ticker):
     try:
         return yf.Ticker(ticker).info
